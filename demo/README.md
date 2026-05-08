@@ -9,6 +9,8 @@
 
 依赖方向：`simkit` ← `agent` ← `server`。
 
+**参赛约束：** Agent **禁止**直接读取 `server/data/cargo_dataset.jsonl`、`server/data/drivers.json` 等原始数据文件；货源与司机信息须通过 **`SimulationApiPort`**（如 `query_cargo`、`get_driver_status`、`query_decision_history`）获取。说明见仓库根目录 `docs/02-数据说明.md`「1.1 信息获取约束」。
+
 ## 目录结构
 
 ```text

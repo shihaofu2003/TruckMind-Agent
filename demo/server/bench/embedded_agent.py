@@ -15,6 +15,17 @@ from simkit.ports import SimulationApiPort
 from .model_gateway_client import ModelGatewayClient
 
 
+def _slice_decision_history_records(records: list[dict[str, Any]], step: int) -> list[dict[str, Any]]:
+    """step == -1 全部；step > 0 末尾 step 条；0 为空。"""
+    if step == -1:
+        return list(records)
+    if step <= 0:
+        return []
+    if len(records) <= step:
+        return list(records)
+    return records[-step:]
+
+
 class EmbeddedDecisionEnvironment:
     """决策一步内可调用的环境：司机/货源查询 + 模型补全。"""
 
@@ -24,12 +35,14 @@ class EmbeddedDecisionEnvironment:
         manager: DriverStateManager,
         model_gateway: ModelGatewayClient,
         *,
+        session_actions_by_driver: dict[str, list[dict[str, Any]]] | None = None,
         nearest_cargo_limit: int = 100,
         cargo_view_batch_size: int = 10,
     ) -> None:
         self._repo = repo
         self._manager = manager
         self._model_gateway = model_gateway
+        self._session_actions_by_driver = session_actions_by_driver
         self._nearest_cargo_limit = nearest_cargo_limit
         self._cargo_view_batch_size = cargo_view_batch_size
         self._logger = logging.getLogger("bench.embedded_agent.environment")
@@ -67,6 +80,37 @@ class EmbeddedDecisionEnvironment:
             scan_cost_minutes,
         )
         return raw
+
+    def query_decision_history(self, driver_id: str, step: int) -> dict[str, Any]:
+        """仅评测会话内存（编排器每步追加的同结构字典）；供决策过程中查询，不推进仿真时间。"""
+        if step < -1:
+            raise ValueError("step 须为 >= -1；-1 表示全部，0 表示返回 0 条，正整数表示末尾若干条")
+        did = driver_id.strip()
+        if self._session_actions_by_driver is None:
+            return {
+                "driver_id": did,
+                "detail": "session_actions_not_configured",
+                "total_steps": 0,
+                "step_param": step,
+                "returned_count": 0,
+                "records": [],
+            }
+        records = list(self._session_actions_by_driver.get(did, []))
+        out = _slice_decision_history_records(records, step)
+        self._logger.info(
+            "query_decision_history driver_id=%s step=%s total=%s returned=%s",
+            did,
+            step,
+            len(records),
+            len(out),
+        )
+        return {
+            "driver_id": did,
+            "total_steps": len(records),
+            "step_param": step,
+            "returned_count": len(out),
+            "records": out,
+        }
 
     def model_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         resp = self._model_gateway.chat_completion(payload)
@@ -151,11 +195,14 @@ def build_embedded_agent_decision_engine(
     repo: CargoRepository,
     manager: DriverStateManager,
     model_gateway: ModelGatewayClient,
+    *,
+    session_actions_by_driver: dict[str, list[dict[str, Any]]] | None = None,
 ) -> EmbeddedAgentDecisionEngine:
     environment = EmbeddedDecisionEnvironment(
         repo=repo,
         manager=manager,
         model_gateway=model_gateway,
+        session_actions_by_driver=session_actions_by_driver,
     )
     environment_port: SimulationApiPort = environment
     decision_service = ModelDecisionService(environment_port)

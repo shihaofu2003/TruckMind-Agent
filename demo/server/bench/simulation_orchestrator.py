@@ -37,6 +37,8 @@ class SimulationOrchestrator:
         reposition_speed_km_per_hour: float,
         simulation_max_steps: int,
         simulation_duration_days: int,
+        *,
+        session_actions_by_driver: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         self._repo = cargo_repository
         self._manager = driver_state_manager
@@ -46,6 +48,7 @@ class SimulationOrchestrator:
         self._simulation_max_steps = simulation_max_steps
         self._simulation_duration_days = simulation_duration_days
         self._simulation_horizon_minutes = int(simulation_duration_days) * 24 * 60
+        self._session_actions_by_driver = session_actions_by_driver
         self._simulate_started_at: float | None = None
         self._logger = self._build_logger()
 
@@ -78,7 +81,12 @@ class SimulationOrchestrator:
 
         month_duration_minutes = self._simulation_horizon_minutes
         driver_ids = self._manager.list_driver_ids()
-        actions_by_driver: dict[str, list[dict[str, Any]]] = {driver_id: [] for driver_id in driver_ids}
+        if self._session_actions_by_driver is not None:
+            actions_by_driver = self._session_actions_by_driver
+            for driver_id in driver_ids:
+                actions_by_driver.setdefault(driver_id, [])
+        else:
+            actions_by_driver = {driver_id: [] for driver_id in driver_ids}
         steps_by_driver = {driver_id: 0 for driver_id in driver_ids}
 
         total_steps = 0

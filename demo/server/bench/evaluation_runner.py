@@ -37,6 +37,9 @@ class EvaluationRunner:
         repo.load()
         manager = DriverStateManager(settings.drivers_path)
         manager.load()
+        session_actions_by_driver: dict[str, list[dict[str, Any]]] = {
+            driver_id: [] for driver_id in manager.list_driver_ids()
+        }
 
         model_gateway = ModelGatewayClient(
             api_url=settings.model_api_url,
@@ -49,6 +52,7 @@ class EvaluationRunner:
                 repo=repo,
                 manager=manager,
                 model_gateway=model_gateway,
+                session_actions_by_driver=session_actions_by_driver,
             )
             orchestrator = SimulationOrchestrator(
                 cargo_repository=repo,
@@ -58,6 +62,7 @@ class EvaluationRunner:
                 reposition_speed_km_per_hour=settings.reposition_speed_km_per_hour,
                 simulation_max_steps=settings.simulation_max_steps,
                 simulation_duration_days=settings.simulation_duration_days,
+                session_actions_by_driver=session_actions_by_driver,
             )
 
             manager.start_simulation_minutes(driver_id=None, progress_minutes=0)

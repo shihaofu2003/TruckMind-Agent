@@ -1,34 +1,76 @@
 """计算 2026 年 3 月每个司机累计收益（与仿真结果 JSONL 对齐）。
 
 输出 `monthly_income_202603.json`：`drivers` 为数组，每项含该司机 `driver_id`、`income`、`token_usage`；
-全量汇总在 `summary`。
+全量汇总在 `summary`。偏好罚分按 `server/data/drivers.json` 中每条规则的 penalty 字段计。
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import sys
-from datetime import datetime
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-_DEMO_ROOT = Path(__file__).resolve().parent
-if str(_DEMO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_DEMO_ROOT))
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPT_DIR.parent
+_DEMO_PACKAGE_ROOT = _REPO_ROOT / "demo"
+if str(_DEMO_PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_DEMO_PACKAGE_ROOT))
 
 from simkit.simulation_actions import haversine_km
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-SERVER_ROOT = PROJECT_ROOT / "server"
-RESULTS_DIR = PROJECT_ROOT / "results"
-CARGO_DATASET = SERVER_ROOT / "data" / "cargo_dataset.jsonl"
-DRIVERS_DATASET = SERVER_ROOT / "data" / "drivers.json"
-CONFIG_PATH = SERVER_ROOT / "config" / "config.json"
-OUTPUT_FILE = RESULTS_DIR / "monthly_income_202603.json"
-RUN_SUMMARY_FILE = RESULTS_DIR / "run_summary_202603.json"
 _SIMULATION_EPOCH = datetime(2026, 3, 1, 0, 0, 0)
+
+# --- 地理与时间常量（与 drivers.json 描述一致）---
+SHENZHEN_LAT_MIN = 22.42
+SHENZHEN_LAT_MAX = 22.89
+SHENZHEN_LNG_MIN = 113.74
+SHENZHEN_LNG_MAX = 114.66
+
+MAR10_DAY_IDX = 9
+MAR10_10_MIN = MAR10_DAY_IDX * 1440 + 10 * 60
+MAR13_DAY_IDX = 12
+MAR13_22_MIN = MAR13_DAY_IDX * 1440 + 22 * 60
+# D010 家事：自 3/10 10:00 起 72 小时窗口（至 3/13 10:00）
+D010_HOME_WINDOW_END_MIN = MAR10_10_MIN + 72 * 60
+
+D010_PICKUP_LAT, D010_PICKUP_LNG = 23.21, 113.37
+D010_HOME_LAT, D010_HOME_LNG = 23.19, 113.36
+
+D003_FORBIDDEN_ZONE_LAT = 23.30
+D003_FORBIDDEN_ZONE_LNG = 113.52
+D003_FORBIDDEN_ZONE_RADIUS_KM = 20.0
+
+
+def _resolve_config_json(server_config_dir: Path) -> Path:
+    primary = server_config_dir / "config.json"
+    if primary.is_file():
+        return primary
+    fallback = server_config_dir / "config.example.json"
+    if fallback.is_file():
+        return fallback
+    raise FileNotFoundError(f"缺少 server 配置: {primary} 或 {fallback}")
+
+
+def _parse_epoch_minutes(ts: str) -> int:
+    return int((_SIMULATION_EPOCH.fromisoformat(ts.strip().replace(" ", "T")) - _SIMULATION_EPOCH).total_seconds() // 60)
+
+
+@dataclass(frozen=True)
+class PreferenceRuleSpec:
+    """drivers.json 中单条 preference 的评测口径字段。"""
+
+    content: str
+    start_minutes: int
+    end_minutes: int
+    penalty_amount: float
+    penalty_cap: float | None
 
 
 def load_cargo_map(path: Path) -> dict[str, dict[str, Any]]:
@@ -57,8 +99,8 @@ def load_cargo_map(path: Path) -> dict[str, dict[str, Any]]:
             remove_time = str(item.get("remove_time", "")).strip()
             if not create_time or not remove_time:
                 raise ValueError(f"货源文件第 {line_no} 行缺少 create_time/remove_time")
-            create_minutes = int((_SIMULATION_EPOCH.fromisoformat(create_time.replace(" ", "T")) - _SIMULATION_EPOCH).total_seconds() // 60)
-            remove_minutes = int((_SIMULATION_EPOCH.fromisoformat(remove_time.replace(" ", "T")) - _SIMULATION_EPOCH).total_seconds() // 60)
+            create_minutes = _parse_epoch_minutes(create_time)
+            remove_minutes = _parse_epoch_minutes(remove_time)
             cost_time_minutes = int(item.get("cost_time_minutes", 0) or 0)
             load_window = item.get("load_time")
             load_start_minutes: int | None = None
@@ -70,12 +112,12 @@ def load_cargo_map(path: Path) -> dict[str, dict[str, Any]]:
                 right = str(load_window[1]).strip()
                 if not left or not right:
                     raise ValueError(f"货源文件第 {line_no} 行 load_time 为空")
-                load_start_minutes = int((_SIMULATION_EPOCH.fromisoformat(left.replace(" ", "T")) - _SIMULATION_EPOCH).total_seconds() // 60)
-                load_end_minutes = int((_SIMULATION_EPOCH.fromisoformat(right.replace(" ", "T")) - _SIMULATION_EPOCH).total_seconds() // 60)
+                load_start_minutes = _parse_epoch_minutes(left)
+                load_end_minutes = _parse_epoch_minutes(right)
                 if load_end_minutes < load_start_minutes:
-                    # 数据集中存在少量异常时间窗（结束早于开始），这里降级为“无装货窗约束”避免统计脚本整体中断。
                     load_start_minutes = None
                     load_end_minutes = None
+            cargo_name = str(item.get("cargo_name", "") or "").strip()
             cargo_map[cargo_id] = {
                 "price": float(item.get("price", 0.0)) / 100.0,
                 "distance_km": distance_km,
@@ -88,6 +130,7 @@ def load_cargo_map(path: Path) -> dict[str, dict[str, Any]]:
                 "cost_time_minutes": cost_time_minutes,
                 "load_start_minutes": load_start_minutes,
                 "load_end_minutes": load_end_minutes,
+                "cargo_name": cargo_name,
             }
     return cargo_map
 
@@ -108,11 +151,51 @@ def load_driver_cost_map(path: Path) -> dict[str, float]:
     return cost_map
 
 
-def load_driver_preferences_map(path: Path) -> dict[str, list[str]]:
+def _preference_entry_to_rule(entry: Any) -> PreferenceRuleSpec | None:
+    if isinstance(entry, str):
+        text = entry.strip()
+        if not text:
+            return None
+        return PreferenceRuleSpec(
+            content=text,
+            start_minutes=0,
+            end_minutes=31 * 1440,
+            penalty_amount=0.0,
+            penalty_cap=0.0,
+        )
+    if not isinstance(entry, dict):
+        return None
+    raw_text = entry.get("content")
+    if raw_text is None:
+        raw_text = entry.get("text")
+    content = str(raw_text or "").strip()
+    if not content:
+        return None
+    st = str(entry.get("start_time", "") or "").strip()
+    et = str(entry.get("end_time", "") or "").strip()
+    start_minutes = _parse_epoch_minutes(st) if st else 0
+    end_minutes = _parse_epoch_minutes(et) if et else 31 * 1440
+    penalty_amount = float(entry.get("penalty_amount", 0.0) or 0.0)
+    cap_raw = entry.get("penalty_cap")
+    penalty_cap: float | None
+    if cap_raw is None:
+        penalty_cap = None
+    else:
+        penalty_cap = float(cap_raw)
+    return PreferenceRuleSpec(
+        content=content,
+        start_minutes=start_minutes,
+        end_minutes=end_minutes,
+        penalty_amount=penalty_amount,
+        penalty_cap=penalty_cap,
+    )
+
+
+def load_driver_preference_rules(path: Path) -> dict[str, list[PreferenceRuleSpec]]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise ValueError("drivers.json 必须为数组")
-    out: dict[str, list[str]] = {}
+    out: dict[str, list[PreferenceRuleSpec]] = {}
     for item in raw:
         driver_id = str(item.get("driver_id", "")).strip()
         if not driver_id:
@@ -120,8 +203,18 @@ def load_driver_preferences_map(path: Path) -> dict[str, list[str]]:
         prefs = item.get("preferences") or []
         if not isinstance(prefs, list):
             prefs = []
-        out[driver_id] = [str(x) for x in prefs if isinstance(x, str)]
+        rules: list[PreferenceRuleSpec] = []
+        for p in prefs:
+            spec = _preference_entry_to_rule(p)
+            if spec is not None:
+                rules.append(spec)
+        out[driver_id] = rules
     return out
+
+
+def load_driver_preferences_map(path: Path) -> dict[str, list[str]]:
+    rules_map = load_driver_preference_rules(path)
+    return {did: [r.content for r in rules] for did, rules in rules_map.items()}
 
 
 def iter_result_files(results_dir: Path) -> list[Path]:
@@ -138,11 +231,11 @@ def load_simulate_time_seconds(path: Path) -> float | None:
     return None
 
 
-def load_reposition_speed_km_per_hour(path: Path) -> float:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+def load_reposition_speed_km_per_hour(config_path: Path) -> float:
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
     value = raw.get("reposition_speed_km_per_hour")
     if not isinstance(value, (int, float)) or float(value) <= 0:
-        raise ValueError("config.json 缺少有效字段 reposition_speed_km_per_hour")
+        raise ValueError(f"{config_path.name} 缺少有效字段 reposition_speed_km_per_hour")
     return float(value)
 
 
@@ -151,7 +244,6 @@ def load_simulation_duration_days(path: Path) -> int:
     value = raw.get("simulation_duration_days")
     if not isinstance(value, int) or value <= 0:
         raise ValueError("run_summary_202603.json 缺少有效字段 simulation_duration_days")
-    # 结算口径封顶 30 天：信任 run_summary 提供的天数，但不会超过赛题月度上限。
     return min(int(value), 30)
 
 
@@ -162,12 +254,10 @@ def _nearly_equal(a: float, b: float, eps: float = 1e-4) -> bool:
 def _distance_minutes(distance_km: float, speed_km_per_hour: float) -> int:
     if distance_km <= 0:
         return 1
-    import math
     return max(1, int(math.ceil((distance_km / speed_km_per_hour) * 60.0)))
 
 
 def _iter_day_segments(start_min: int, end_min: int) -> list[tuple[int, int]]:
-    """按天拆分 [start_min, end_min) 区间，返回 [(day_idx, segment_minutes), ...]。"""
     out: list[tuple[int, int]] = []
     if end_min <= start_min:
         return out
@@ -183,6 +273,79 @@ def _iter_day_segments(start_min: int, end_min: int) -> list[tuple[int, int]]:
 
 def _interval_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
     return max(a_start, b_start) < min(a_end, b_end)
+
+
+def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not intervals:
+        return []
+    intervals.sort()
+    merged: list[tuple[int, int]] = []
+    for s, e in intervals:
+        if not merged or s > merged[-1][1]:
+            merged.append((s, e))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+    return merged
+
+
+def _longest_merged_span_minutes(intervals: list[tuple[int, int]]) -> int:
+    longest = 0
+    for s, e in _merge_intervals(intervals):
+        longest = max(longest, e - s)
+    return longest
+
+
+def _in_shenzhen(lat: float, lng: float) -> bool:
+    return SHENZHEN_LAT_MIN <= lat <= SHENZHEN_LAT_MAX and SHENZHEN_LNG_MIN <= lng <= SHENZHEN_LNG_MAX
+
+
+def _night_windows_23_to_6(day: int) -> tuple[int, int, int, int]:
+    w1s = day * 1440 + 23 * 60
+    w1e = (day + 1) * 1440
+    w2s = (day + 1) * 1440
+    w2e = (day + 1) * 1440 + 6 * 60
+    return w1s, w1e, w2s, w2e
+
+
+def _sum_deadhead_km(ctxs: list[dict[str, Any]]) -> float:
+    total = 0.0
+    for c in ctxs:
+        res = c.get("result") if isinstance(c.get("result"), dict) else {}
+        if c["action_name"] == "reposition":
+            total += float(res.get("distance_km", 0.0) or 0.0)
+        elif c["action_name"] == "take_order" and bool(res.get("accepted", False)):
+            total += float(res.get("pickup_deadhead_km", 0.0) or 0.0)
+    return total
+
+
+def _wait_intervals_for_day(ctxs: list[dict[str, Any]], day: int) -> list[tuple[int, int]]:
+    d0 = day * 1440
+    d1 = d0 + 1440
+    intervals: list[tuple[int, int]] = []
+    for c in ctxs:
+        if c["action_name"] != "wait" or c["action_exec_cost"] <= 0:
+            continue
+        s = max(c["step_start"], d0)
+        e = min(c["step_end"], d1)
+        if e > s:
+            intervals.append((s, e))
+    return intervals
+
+
+def _active_minutes_by_day(ctxs: list[dict[str, Any]], days: list[int]) -> dict[int, int]:
+    active: dict[int, int] = {d: 0 for d in days}
+    for c in ctxs:
+        if c["action_name"] not in {"take_order", "reposition"}:
+            continue
+        for d, seg in _iter_day_segments(c["action_start"], c["action_end"]):
+            active[d] = active.get(d, 0) + seg
+    return active
+
+
+def _calendar_weekday_202603(day_idx: int) -> int:
+    """0=周一 … 6=周日。"""
+    base = date(2026, 3, 1)
+    return (base + timedelta(days=day_idx)).weekday()
 
 
 def _build_step_contexts(file_path: Path) -> list[dict[str, Any]]:
@@ -206,11 +369,12 @@ def _build_step_contexts(file_path: Path) -> list[dict[str, Any]]:
             action_end = action_start + action_exec_cost
             pos_before = record.get("position_before", {}) or {}
             pos_after = record.get("position_after", {}) or {}
+            action_obj = record.get("action") or {}
             ctxs.append(
                 {
                     "line_no": line_no,
-                    "action_name": str((record.get("action") or {}).get("action", "")).strip().lower(),
-                    "params": (record.get("action") or {}).get("params", {}) or {},
+                    "action_name": str(action_obj.get("action", "")).strip().lower(),
+                    "params": action_obj.get("params", {}) or {},
                     "result": result if isinstance(result, dict) else {},
                     "step_start": step_start,
                     "action_start": action_start,
@@ -227,119 +391,524 @@ def _build_step_contexts(file_path: Path) -> list[dict[str, Any]]:
     return ctxs
 
 
-def _apply_daily_penalty(violation_count: int, amount_per_violation: float, cap_amount: float) -> float:
-    if violation_count <= 0:
-        return 0.0
-    return float(min(violation_count * amount_per_violation, cap_amount))
+class DriverPreferenceCalculatorBase(ABC):
+    """司机偏好罚分计算器基类。"""
+
+    driver_id: str
+
+    @abstractmethod
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        raise NotImplementedError
 
 
-def _evaluate_preferences(
-    driver_id: str,
-    file_path: Path,
-    preferences: list[str],
-    simulation_duration_days: int,
-) -> tuple[float, dict[str, Any]]:
-    """按司机偏好规则计算罚分。返回 (penalty, details)。"""
-    if driver_id not in {"D006", "D007", "D008", "D009", "D010"}:
-        return 0.0, {"rules": []}
-    ctxs = _build_step_contexts(file_path)
-    if not ctxs:
-        return 0.0, {"rules": []}
+class DriverD001PreferenceCalculator(DriverPreferenceCalculatorBase):
+    driver_id = "D001"
 
-    rules: list[dict[str, Any]] = []
-    total_penalty = 0.0
-    days = list(range(simulation_duration_days))
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        detail_rules: list[dict[str, Any]] = []
+        total = 0.0
+        days = list(range(simulation_duration_days))
+        r0, r1, r2 = rules[0], rules[1], rules[2]
 
-    if driver_id == "D006":
-        # 每天至少 5 小时连续休息（用 wait 的 action_exec 近似休息时段）
-        violation_days = 0
+        violation_rest = 0
         for day in days:
-            intervals: list[tuple[int, int]] = []
-            for c in ctxs:
-                if c["action_name"] != "wait" or c["action_exec_cost"] <= 0:
-                    continue
-                # 休息按整步区间计算：查看货源耗时不打断连续休息
-                start = c["step_start"]
-                end = c["step_end"]
-                d0 = day * 1440
-                d1 = d0 + 1440
-                s = max(start, d0)
-                e = min(end, d1)
-                if e > s:
-                    intervals.append((s, e))
-            intervals.sort()
-            merged: list[tuple[int, int]] = []
-            for s, e in intervals:
-                if not merged or s > merged[-1][1]:
-                    merged.append((s, e))
-                else:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-            longest = 0
-            for s, e in merged:
-                longest = max(longest, e - s)
-            if longest < 300:
-                violation_days += 1
-        penalty = _apply_daily_penalty(violation_days, amount_per_violation=400.0, cap_amount=4000.0)
-        total_penalty += penalty
-        rules.append(
-            {
-                "rule": "每天至少连续休息5小时",
-                "preference_text": preferences[0] if preferences else "",
-                "violations": violation_days,
-                "penalty": penalty,
-            }
+            intervals = _wait_intervals_for_day(ctxs, day)
+            if _longest_merged_span_minutes(intervals) < 8 * 60:
+                violation_rest += 1
+        pen0 = min(violation_rest * r0.penalty_amount, r0.penalty_cap or float("inf"))
+        total += pen0
+        detail_rules.append(
+            {"rule": "每日连续熄火休息≥8小时", "violations": violation_rest, "penalty": round(pen0, 2), "preference_text": r0.content}
         )
 
-    if driver_id == "D007":
-        # 每天 23:00-04:00 休息：不接单也不空驶（按动作执行区间与窗口相交判断，包含跨窗）
-        violation_days_set: set[int] = set()
+        forbidden = {"化工塑料", "煤炭矿产"}
+        bad_orders = 0
+        for c in ctxs:
+            if c["action_name"] != "take_order":
+                continue
+            if not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            name = str(cargo_map.get(cid, {}).get("cargo_name", "") or "")
+            if name in forbidden:
+                bad_orders += 1
+        pen1 = min(bad_orders * r1.penalty_amount, r1.penalty_cap or float("inf"))
+        total += pen1
+        detail_rules.append({"rule": "禁接化工塑料/煤炭矿产", "violations": bad_orders, "penalty": round(pen1, 2), "preference_text": r1.content})
+
+        sz_violations = 0
+        for c in ctxs:
+            if not _in_shenzhen(c["before_lat"], c["before_lng"]) or not _in_shenzhen(c["after_lat"], c["after_lng"]):
+                sz_violations += 1
+        pen2 = min(sz_violations * r2.penalty_amount, r2.penalty_cap or float("inf"))
+        total += pen2
+        detail_rules.append({"rule": "深圳市范围内行驶与停车", "violations": sz_violations, "penalty": round(pen2, 2), "preference_text": r2.content})
+
+        return round(total, 2), {"rules": detail_rules}
+
+
+class DriverD002PreferenceCalculator(DriverPreferenceCalculatorBase):
+    driver_id = "D002"
+
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        detail_rules: list[dict[str, Any]] = []
+        total = 0.0
+        days = list(range(simulation_duration_days))
+        r0, r1, r2 = rules[0], rules[1], rules[2]
+
+        # 规则：自然月内至少 4 个自然日「无成交接单」；空驶/ reposition、wait 均不抵消该日计数。
+        free_days = 0
+        for day in days:
+            took_accepted = False
+            for c in ctxs:
+                if c["action_name"] != "take_order":
+                    continue
+                if c["step_end"] // 1440 != day:
+                    continue
+                if bool(c["result"].get("accepted", False)):
+                    took_accepted = True
+                    break
+            if not took_accepted:
+                free_days += 1
+        pen0 = 0.0 if free_days >= 4 else (r0.penalty_cap or r0.penalty_amount)
+        total += pen0
+        detail_rules.append({"rule": "自然月至少4整天无成交接单（空驶不计）", "free_days": free_days, "penalty": round(pen0, 2), "preference_text": r0.content})
+
+        veg_orders = 0
+        for c in ctxs:
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            if str(cargo_map.get(cid, {}).get("cargo_name", "") or "") == "蔬菜":
+                veg_orders += 1
+        pen1 = min(veg_orders * r1.penalty_amount, r1.penalty_cap or float("inf"))
+        total += pen1
+        detail_rules.append({"rule": "不接蔬菜", "violations": veg_orders, "penalty": round(pen1, 2), "preference_text": r1.content})
+
+        viol_days = 0
+        for day in days:
+            intervals = _wait_intervals_for_day(ctxs, day)
+            if _longest_merged_span_minutes(intervals) < 4 * 60:
+                viol_days += 1
+        pen2 = min(viol_days * r2.penalty_amount, r2.penalty_cap or float("inf"))
+        total += pen2
+        detail_rules.append({"rule": "每日连续停车歇脚≥4小时", "violations": viol_days, "penalty": round(pen2, 2), "preference_text": r2.content})
+
+        return round(total, 2), {"rules": detail_rules}
+
+
+class DriverD003PreferenceCalculator(DriverPreferenceCalculatorBase):
+    driver_id = "D003"
+
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        detail_rules: list[dict[str, Any]] = []
+        total = 0.0
+        days = list(range(simulation_duration_days))
+        r0, r1, r2 = rules[0], rules[1], rules[2]
+
+        deadhead = _sum_deadhead_km(ctxs)
+        over = max(0.0, deadhead - 100.0)
+        pen0 = min(over * r0.penalty_amount, r0.penalty_cap or float("inf"))
+        total += pen0
+        detail_rules.append({"rule": "月度空驶赶路≤100km（超额按公里计）", "deadhead_km": round(deadhead, 2), "over_km": round(over, 2), "penalty": round(pen0, 2), "preference_text": r0.content})
+
+        zone_violations = 0
+        clat, clng, r_km = D003_FORBIDDEN_ZONE_LAT, D003_FORBIDDEN_ZONE_LNG, D003_FORBIDDEN_ZONE_RADIUS_KM
+        for c in ctxs:
+            if haversine_km(c["before_lat"], c["before_lng"], clat, clng) <= r_km or haversine_km(c["after_lat"], c["after_lng"], clat, clng) <= r_km:
+                zone_violations += 1
+        pen1 = min(zone_violations * r1.penalty_amount, r1.penalty_cap or float("inf"))
+        total += pen1
+        detail_rules.append(
+            {"rule": "禁入圆区(23.30,113.52)半径20km", "violations": zone_violations, "penalty": round(pen1, 2), "preference_text": r1.content}
+        )
+
+        viol_days: set[int] = set()
         for c in ctxs:
             if c["action_name"] not in {"take_order", "reposition"}:
                 continue
-            a_start = c["action_start"]
-            a_end = c["action_end"]
+            a_start, a_end = c["action_start"], c["action_end"]
+            for day in days:
+                w1s = day * 1440 + 2 * 60
+                w1e = day * 1440 + 5 * 60
+                if _interval_overlap(a_start, a_end, w1s, w1e):
+                    viol_days.add(day)
+        pen2 = min(len(viol_days) * r2.penalty_amount, r2.penalty_cap or float("inf"))
+        total += pen2
+        detail_rules.append({"rule": "凌晨2–5点不接单不空驶", "violations": len(viol_days), "penalty": round(pen2, 2), "preference_text": r2.content})
+
+        return round(total, 2), {"rules": detail_rules}
+
+
+class DriverD004PreferenceCalculator(DriverPreferenceCalculatorBase):
+    driver_id = "D004"
+
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        detail_rules: list[dict[str, Any]] = []
+        total = 0.0
+        days = list(range(simulation_duration_days))
+        r0, r1, r2 = rules[0], rules[1], rules[2]
+
+        late_first = 0
+        for day in days:
+            first_start: int | None = None
+            for c in ctxs:
+                if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                    continue
+                if c["action_start"] // 1440 != day:
+                    continue
+                if first_start is None or c["action_start"] < first_start:
+                    first_start = c["action_start"]
+            if first_start is not None and first_start >= day * 1440 + 12 * 60:
+                late_first += 1
+        pen0 = min(late_first * r0.penalty_amount, r0.penalty_cap or float("inf"))
+        total += pen0
+        detail_rules.append({"rule": "有接单则首单开工不晚于当日12:00", "violations": late_first, "penalty": round(pen0, 2), "preference_text": r0.content})
+
+        extra_orders_pen = 0.0
+        for day in days:
+            cnt = 0
+            for c in ctxs:
+                if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                    continue
+                if c["action_start"] // 1440 != day:
+                    continue
+                cnt += 1
+            if cnt > 3:
+                extra_orders_pen += (cnt - 3) * r1.penalty_amount
+        total += extra_orders_pen
+        detail_rules.append({"rule": "同日接单≤3单", "penalty": round(extra_orders_pen, 2), "preference_text": r1.content})
+
+        lunch_viol = 0
+        for c in ctxs:
+            if c["action_name"] not in {"take_order", "reposition"}:
+                continue
+            for day in days:
+                ls = day * 1440 + 12 * 60
+                le = day * 1440 + 13 * 60
+                if _interval_overlap(c["action_start"], c["action_end"], ls, le):
+                    lunch_viol += 1
+                    break
+        pen2 = min(lunch_viol * r2.penalty_amount, r2.penalty_cap or float("inf"))
+        total += pen2
+        detail_rules.append({"rule": "12–13点不接单不空驶", "violations": lunch_viol, "penalty": round(pen2, 2), "preference_text": r2.content})
+
+        return round(total, 2), {"rules": detail_rules}
+
+
+class DriverD005PreferenceCalculator(DriverPreferenceCalculatorBase):
+    driver_id = "D005"
+
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        detail_rules: list[dict[str, Any]] = []
+        total = 0.0
+        days = list(range(simulation_duration_days))
+        r0, r1, r2 = rules[0], rules[1], rules[2]
+
+        haul_bad = 0
+        pickup_bad = 0
+        for c in ctxs:
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            cg = cargo_map.get(cid)
+            if cg is None:
+                continue
+            haul = float(cg["distance_km"])
+            if haul > 100:
+                haul_bad += 1
+            pk = haversine_km(c["before_lat"], c["before_lng"], float(cg["start_lat"]), float(cg["start_lng"]))
+            if pk > 90:
+                pickup_bad += 1
+        pen0 = haul_bad * r0.penalty_amount
+        if r0.penalty_cap is not None:
+            pen0 = min(pen0, r0.penalty_cap)
+        pen1 = pickup_bad * r1.penalty_amount
+        if r1.penalty_cap is not None:
+            pen1 = min(pen1, r1.penalty_cap)
+        total += pen0 + pen1
+        detail_rules.append({"rule": "单笔装卸距离≤100km", "violations": haul_bad, "penalty": round(pen0, 2), "preference_text": r0.content})
+        detail_rules.append({"rule": "赴装货点空驶≤90km", "violations": pickup_bad, "penalty": round(pen1, 2), "preference_text": r1.content})
+
+        viol_days: set[int] = set()
+        for c in ctxs:
+            if c["action_name"] not in {"take_order", "reposition"}:
+                continue
+            for day in days:
+                w1s, w1e, w2s, w2e = _night_windows_23_to_6(day)
+                if _interval_overlap(c["action_start"], c["action_end"], w1s, w1e) or _interval_overlap(
+                    c["action_start"], c["action_end"], w2s, w2e
+                ):
+                    viol_days.add(day)
+        pen2 = min(len(viol_days) * r2.penalty_amount, r2.penalty_cap or float("inf"))
+        total += pen2
+        detail_rules.append({"rule": "每日23–次日6不接单不空驶", "violations": len(viol_days), "penalty": round(pen2, 2), "preference_text": r2.content})
+
+        return round(total, 2), {"rules": detail_rules}
+
+
+class DriverD006PreferenceCalculator(DriverPreferenceCalculatorBase):
+    driver_id = "D006"
+
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        detail_rules: list[dict[str, Any]] = []
+        total = 0.0
+        days = list(range(simulation_duration_days))
+        r0, r1, r2, r3 = rules[0], rules[1], rules[2], rules[3]
+
+        viol_days = 0
+        for day in days:
+            intervals = _wait_intervals_for_day(ctxs, day)
+            if _longest_merged_span_minutes(intervals) < 5 * 60:
+                viol_days += 1
+        pen0 = min(viol_days * r0.penalty_amount, r0.penalty_cap or float("inf"))
+        total += pen0
+        detail_rules.append({"rule": "每日连续停车休息≥5小时", "violations": viol_days, "penalty": round(pen0, 2), "preference_text": r0.content})
+
+        fish_orders = 0
+        for c in ctxs:
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            if str(cargo_map.get(cid, {}).get("cargo_name", "") or "") == "鲜活水产品":
+                fish_orders += 1
+        pen1 = min(fish_orders * r1.penalty_amount, r1.penalty_cap or float("inf"))
+        total += pen1
+        detail_rules.append({"rule": "不接鲜活水产品", "violations": fish_orders, "penalty": round(pen1, 2), "preference_text": r1.content})
+
+        haul_bad = 0
+        for c in ctxs:
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            cg = cargo_map.get(cid)
+            if cg is None:
+                continue
+            if float(cg["distance_km"]) > 150:
+                haul_bad += 1
+        pen2 = min(haul_bad * r2.penalty_amount, r2.penalty_cap or float("inf"))
+        total += pen2
+        detail_rules.append({"rule": "单笔装卸距离≤150km", "violations": haul_bad, "penalty": round(pen2, 2), "preference_text": r2.content})
+
+        active = _active_minutes_by_day(ctxs, days)
+        off_days = sum(1 for d in days if active.get(d, 0) == 0)
+        pen3 = 0.0 if off_days >= 2 else (r3.penalty_cap or r3.penalty_amount)
+        total += pen3
+        detail_rules.append({"rule": "每月至少2整天不接单且不外跑", "off_days": off_days, "penalty": round(pen3, 2), "preference_text": r3.content})
+
+        return round(total, 2), {"rules": detail_rules}
+
+
+class DriverD007PreferenceCalculator(DriverPreferenceCalculatorBase):
+    driver_id = "D007"
+
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        detail_rules: list[dict[str, Any]] = []
+        total = 0.0
+        days = list(range(simulation_duration_days))
+        r0, r1, r2, r3 = rules[0], rules[1], rules[2], rules[3]
+
+        viol_days_set: set[int] = set()
+        for c in ctxs:
+            if c["action_name"] not in {"take_order", "reposition"}:
+                continue
             for day in days:
                 w1s = day * 1440 + 23 * 60
                 w1e = (day + 1) * 1440
                 w2s = (day + 1) * 1440
                 w2e = (day + 1) * 1440 + 4 * 60
-                if _interval_overlap(a_start, a_end, w1s, w1e) or _interval_overlap(a_start, a_end, w2s, w2e):
-                    violation_days_set.add(day)
-        violations = len(violation_days_set)
-        penalty = _apply_daily_penalty(violations, amount_per_violation=500.0, cap_amount=5000.0)
-        total_penalty += penalty
-        rules.append(
-            {
-                "rule": "23:00-04:00休息（不接单不空驶）",
-                "preference_text": preferences[0] if preferences else "",
-                "violations": violations,
-                "penalty": penalty,
-            }
-        )
+                if _interval_overlap(c["action_start"], c["action_end"], w1s, w1e) or _interval_overlap(
+                    c["action_start"], c["action_end"], w2s, w2e
+                ):
+                    viol_days_set.add(day)
+        pen0 = min(len(viol_days_set) * r0.penalty_amount, r0.penalty_cap or float("inf"))
+        total += pen0
+        detail_rules.append({"rule": "每日23–次日4不接单不空驶", "violations": len(viol_days_set), "penalty": round(pen0, 2), "preference_text": r0.content})
 
-    if driver_id == "D008":
-        # 月度至少 2 天完全不出车（仅 take_order/reposition 视为出车，wait 不算）
-        active_minutes_by_day: dict[int, int] = {d: 0 for d in days}
+        me_orders = 0
         for c in ctxs:
-            if c["action_name"] not in {"take_order", "reposition"}:
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
                 continue
-            for d, seg in _iter_day_segments(c["action_start"], c["action_end"]):
-                active_minutes_by_day[d] = active_minutes_by_day.get(d, 0) + seg
-        off_days = sum(1 for d in days if active_minutes_by_day.get(d, 0) == 0)
-        ok = off_days >= 2
-        penalty = 0.0 if ok else 3000.0
-        total_penalty += penalty
-        rules.append(
-            {
-                "rule": "每月至少2天完全不出车",
-                "preference_text": preferences[0] if preferences else "",
-                "off_days": off_days,
-                "penalty": penalty,
-            }
-        )
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            if str(cargo_map.get(cid, {}).get("cargo_name", "") or "") == "机械设备":
+                me_orders += 1
+        pen1 = min(me_orders * r1.penalty_amount, r1.penalty_cap or float("inf"))
+        total += pen1
+        detail_rules.append({"rule": "不接机械设备", "violations": me_orders, "penalty": round(pen1, 2), "preference_text": r1.content})
 
-    if driver_id == "D009":
-        # 每天 23:00 前回到家附近 1km；到家后至次日 08:00 不再接单或空驶
+        haul_bad = 0
+        for c in ctxs:
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            cg = cargo_map.get(cid)
+            if cg is None:
+                continue
+            if float(cg["distance_km"]) > 180:
+                haul_bad += 1
+        pen2 = min(haul_bad * r2.penalty_amount, r2.penalty_cap or float("inf"))
+        total += pen2
+        detail_rules.append({"rule": "单笔装卸距离≤180km", "violations": haul_bad, "penalty": round(pen2, 2), "preference_text": r2.content})
+
+        free_full_days = 0
+        for day in days:
+            ordered = False
+            for c in ctxs:
+                if c["action_name"] != "take_order":
+                    continue
+                if c["step_end"] // 1440 != day:
+                    continue
+                if bool(c["result"].get("accepted", False)):
+                    ordered = True
+                    break
+            if not ordered:
+                free_full_days += 1
+        pen3 = 0.0 if free_full_days >= 1 else (r3.penalty_cap or r3.penalty_amount)
+        total += pen3
+        detail_rules.append({"rule": "自然月至少放空一整天不接单", "free_days": free_full_days, "penalty": round(pen3, 2), "preference_text": r3.content})
+
+        return round(total, 2), {"rules": detail_rules}
+
+
+class DriverD008PreferenceCalculator(DriverPreferenceCalculatorBase):
+    driver_id = "D008"
+
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        detail_rules: list[dict[str, Any]] = []
+        total = 0.0
+        days = list(range(simulation_duration_days))
+        r0, r1, r2, r3 = rules[0], rules[1], rules[2], rules[3]
+
+        active = _active_minutes_by_day(ctxs, days)
+        off_days = sum(1 for d in days if active.get(d, 0) == 0)
+        pen0 = 0.0 if off_days >= 2 else (r0.penalty_cap or r0.penalty_amount)
+        total += pen0
+        detail_rules.append({"rule": "自然月至少2天完全歇着", "off_days": off_days, "penalty": round(pen0, 2), "preference_text": r0.content})
+
+        weekday_viol = 0
+        for day in days:
+            if _calendar_weekday_202603(day) >= 5:
+                continue
+            intervals = _wait_intervals_for_day(ctxs, day)
+            if _longest_merged_span_minutes(intervals) < 4 * 60:
+                weekday_viol += 1
+        pen1 = min(weekday_viol * r1.penalty_amount, r1.penalty_cap or float("inf"))
+        total += pen1
+        detail_rules.append({"rule": "平日连续停车休息≥4小时", "violations": weekday_viol, "penalty": round(pen1, 2), "preference_text": r1.content})
+
+        food_orders = 0
+        for c in ctxs:
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            if str(cargo_map.get(cid, {}).get("cargo_name", "") or "") == "食品饮料":
+                food_orders += 1
+        pen2 = min(food_orders * r2.penalty_amount, r2.penalty_cap or float("inf"))
+        total += pen2
+        detail_rules.append({"rule": "尽量不拉食品饮料", "violations": food_orders, "penalty": round(pen2, 2), "preference_text": r2.content})
+
+        pickup_bad = 0
+        for c in ctxs:
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            cg = cargo_map.get(cid)
+            if cg is None:
+                continue
+            pk = haversine_km(c["before_lat"], c["before_lng"], float(cg["start_lat"]), float(cg["start_lng"]))
+            if pk > 50:
+                pickup_bad += 1
+        pen3 = min(pickup_bad * r3.penalty_amount, r3.penalty_cap or float("inf"))
+        total += pen3
+        detail_rules.append({"rule": "赴装货点空驶≤50km", "violations": pickup_bad, "penalty": round(pen3, 2), "preference_text": r3.content})
+
+        return round(total, 2), {"rules": detail_rules}
+
+
+class DriverD009PreferenceCalculator(DriverPreferenceCalculatorBase):
+    driver_id = "D009"
+
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        detail_rules: list[dict[str, Any]] = []
+        total = 0.0
+        days = list(range(simulation_duration_days))
+
+        temp_rule = rules[0]
+        took_temp = False
+        for c in ctxs:
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            if cid != "240646":
+                continue
+            if _interval_overlap(temp_rule.start_minutes, temp_rule.end_minutes + 1, c["action_start"], c["action_end"]):
+                took_temp = True
+                break
+        pen_temp = 0.0 if took_temp else min(temp_rule.penalty_amount, temp_rule.penalty_cap or float("inf"))
+        total += pen_temp
+        detail_rules.append({"rule": "临时约定熟货240646", "satisfied": took_temp, "penalty": round(pen_temp, 2), "preference_text": temp_rule.content})
+
+        r_home = rules[1]
         home_lat, home_lng = 23.12, 113.28
         violation_days = 0
         for day in days:
@@ -349,73 +918,231 @@ def _evaluate_preferences(
             for c in ctxs:
                 if c["step_end"] <= t23:
                     last_pos = (c["after_lat"], c["after_lng"])
-            if last_pos is None:
-                # 若当天 23:00 前无记录，使用首条 before 位置近似
-                first = ctxs[0]
-                last_pos = (first["before_lat"], first["before_lng"])
-            home_ok = haversine_km(last_pos[0], last_pos[1], home_lat, home_lng) <= 1.0
+            if last_pos is None and ctxs:
+                last_pos = (ctxs[0]["before_lat"], ctxs[0]["before_lng"])
+            home_ok = last_pos is not None and haversine_km(last_pos[0], last_pos[1], home_lat, home_lng) <= 1.0
             quiet_ok = True
             for c in ctxs:
-                if c["action_name"] in {"take_order", "reposition"} and _interval_overlap(
-                    c["action_start"], c["action_end"], t23, t8_next
-                ):
+                if c["action_name"] in {"take_order", "reposition"} and _interval_overlap(c["action_start"], c["action_end"], t23, t8_next):
                     quiet_ok = False
                     break
             if not (home_ok and quiet_ok):
                 violation_days += 1
-        penalty = _apply_daily_penalty(violation_days, amount_per_violation=600.0, cap_amount=6000.0)
-        total_penalty += penalty
-        rules.append(
-            {
-                "rule": "每天23:00前回家且到次日08:00不再接单或空驶",
-                "preference_text": preferences[0] if preferences else "",
-                "violations": violation_days,
-                "penalty": penalty,
-            }
+        pen_home = min(violation_days * r_home.penalty_amount, r_home.penalty_cap or float("inf"))
+        total += pen_home
+        detail_rules.append(
+            {"rule": "每日23点前到家且夜间不接单不空驶", "violations": violation_days, "penalty": round(pen_home, 2), "preference_text": r_home.content}
         )
 
-    if driver_id == "D010":
-        # 规则 1：每月到固定点 >= 5 天（同一天多次算 1 次）
-        target_lat, target_lng = 23.13, 113.26
+        r_express = rules[2]
+        express_orders = 0
+        for c in ctxs:
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            cg = cargo_map.get(cid)
+            if cg is None:
+                continue
+            if str(cg.get("cargo_name", "") or "") == "快递快运搬家":
+                express_orders += 1
+        pen_e = min(express_orders * r_express.penalty_amount, r_express.penalty_cap or float("inf"))
+        total += pen_e
+        detail_rules.append({"rule": "不接快递快运搬家", "violations": express_orders, "penalty": round(pen_e, 2), "preference_text": r_express.content})
+
+        return round(total, 2), {"rules": detail_rules}
+
+
+class DriverD010PreferenceCalculator(DriverPreferenceCalculatorBase):
+    driver_id = "D010"
+
+    def compute(
+        self,
+        ctxs: list[dict[str, Any]],
+        cargo_map: dict[str, dict[str, Any]],
+        rules: list[PreferenceRuleSpec],
+        simulation_duration_days: int,
+    ) -> tuple[float, dict[str, Any]]:
+        detail_rules: list[dict[str, Any]] = []
+        total = 0.0
+        days = list(range(simulation_duration_days))
+        family_rule = rules[0]
+
+        pen_family, family_detail = self._evaluate_family_event(ctxs, family_rule)
+        total += pen_family
+        detail_rules.append({**family_detail, "preference_text": family_rule.content})
+
+        r_visit = rules[1]
         visit_days: set[int] = set()
         for c in ctxs:
-            day = c["step_end"] // 1440
-            if haversine_km(c["after_lat"], c["after_lng"], target_lat, target_lng) <= 1.0:
-                visit_days.add(day)
-        visit_ok = len(visit_days) >= 5
-        penalty_visit = 0.0 if visit_ok else 3000.0
-        total_penalty += penalty_visit
-        rules.append(
-            {
-                "rule": "每月至少5天到达目标点",
-                "preference_text": preferences[0] if len(preferences) > 0 else "",
-                "visit_days": len(visit_days),
-                "penalty": penalty_visit,
-            }
-        )
+            if haversine_km(c["after_lat"], c["after_lng"], 23.13, 113.26) <= 1.0:
+                visit_days.add(c["step_end"] // 1440)
+        pen_visit = 0.0 if len(visit_days) >= 5 else (r_visit.penalty_cap or r_visit.penalty_amount)
+        total += pen_visit
+        detail_rules.append({"rule": "月度至少5日到访指定点半径1km", "visit_days": len(visit_days), "penalty": round(pen_visit, 2), "preference_text": r_visit.content})
 
-        # 规则 2：禁止进入区域（圆心 23.30,113.52 半径 2km）
-        center_lat, center_lng, radius_km = 23.30, 113.52, 2.0
-        entered = False
+        r_rest = rules[2]
+        viol_rest = 0
+        for day in days:
+            intervals = _wait_intervals_for_day(ctxs, day)
+            if _longest_merged_span_minutes(intervals) < 3 * 60:
+                viol_rest += 1
+        pen_rest = min(viol_rest * r_rest.penalty_amount, r_rest.penalty_cap or float("inf"))
+        total += pen_rest
+        detail_rules.append({"rule": "每日连续停车休息≥3小时", "violations": viol_rest, "penalty": round(pen_rest, 2), "preference_text": r_rest.content})
+
+        r_soft = rules[3]
+        cloth_orders = 0
         for c in ctxs:
-            if haversine_km(c["before_lat"], c["before_lng"], center_lat, center_lng) <= radius_km:
-                entered = True
+            if c["action_name"] != "take_order" or not bool(c["result"].get("accepted", False)):
+                continue
+            cid = str((c["params"] or {}).get("cargo_id", "")).strip()
+            if str(cargo_map.get(cid, {}).get("cargo_name", "") or "") == "服饰纺织皮革":
+                cloth_orders += 1
+        pen_soft = min(cloth_orders * r_soft.penalty_amount, r_soft.penalty_cap or float("inf"))
+        total += pen_soft
+        detail_rules.append({"rule": "尽量不拉服饰纺织皮革", "violations": cloth_orders, "penalty": round(pen_soft, 2), "preference_text": r_soft.content})
+
+        return round(total, 2), {"rules": detail_rules}
+
+    def _evaluate_family_event(self, ctxs: list[dict[str, Any]], rule: PreferenceRuleSpec) -> tuple[float, dict[str, Any]]:
+        """家事：72h 窗内未在家按分钟×5 元；未接配偶或提前离家（含全程未返抵老家）满足任一项仅扣一次 9000。"""
+        radius_km = 1.0
+        w0, w1 = MAR10_10_MIN, D010_HOME_WINDOW_END_MIN
+
+        def near_pick(lat: float, lng: float) -> bool:
+            return haversine_km(lat, lng, D010_PICKUP_LAT, D010_PICKUP_LNG) <= radius_km
+
+        def near_home(lat: float, lng: float) -> bool:
+            return haversine_km(lat, lng, D010_HOME_LAT, D010_HOME_LNG) <= radius_km
+
+        pickup_done_time: int | None = None
+        pickup_run = 0
+        for c in ctxs:
+            if c["step_end"] <= MAR10_10_MIN:
+                continue
+            if c["action_name"] == "wait":
+                if near_pick(c["after_lat"], c["after_lng"]):
+                    pickup_run += c["action_exec_cost"]
+                    if pickup_run >= 10 and pickup_done_time is None:
+                        pickup_done_time = c["step_end"]
+                else:
+                    pickup_run = 0
+            elif not (near_pick(c["before_lat"], c["before_lng"]) and near_pick(c["after_lat"], c["after_lng"])):
+                pickup_run = 0
+
+        first_home_arrival: int | None = None
+        for c in ctxs:
+            if c["step_end"] < MAR10_10_MIN:
+                continue
+            if near_home(c["after_lat"], c["after_lng"]):
+                first_home_arrival = c["step_end"]
                 break
-            if haversine_km(c["after_lat"], c["after_lng"], center_lat, center_lng) <= radius_km:
-                entered = True
-                break
-        penalty_zone = 3000.0 if entered else 0.0
-        total_penalty += penalty_zone
-        rules.append(
-            {
-                "rule": "禁止进入指定禁入区域",
-                "preference_text": preferences[1] if len(preferences) > 1 else "",
-                "entered": entered,
-                "penalty": penalty_zone,
-            }
+
+        sequence_ok = (
+            pickup_done_time is not None
+            and first_home_arrival is not None
+            and pickup_done_time < first_home_arrival
         )
 
-    return total_penalty, {"rules": rules}
+        minutes_not_home = 0
+        for c in ctxs:
+            seg_a = max(c["step_start"], w0)
+            seg_b = min(c["step_end"], w1)
+            if seg_b <= seg_a:
+                continue
+            at_home = (
+                c["action_name"] == "wait"
+                and near_home(c["before_lat"], c["before_lng"])
+                and near_home(c["after_lat"], c["after_lng"])
+            )
+            if not at_home:
+                minutes_not_home += seg_b - seg_a
+
+        pen_absence = float(minutes_not_home) * 5.0
+
+        never_arrived_home = first_home_arrival is None
+        left_after_arrival = False
+        if first_home_arrival is not None:
+            for c in ctxs:
+                if c["step_start"] < first_home_arrival:
+                    continue
+                if c["step_start"] >= MAR13_22_MIN:
+                    break
+                if c["action_name"] in {"take_order", "reposition"}:
+                    left_after_arrival = True
+                    break
+
+        # 提前离家：全程未返抵老家亦视为提前离家（与「到家后又出车」并列）
+        early_leave = never_arrived_home or left_after_arrival
+
+        pen_fixed_9000 = (
+            float(rule.penalty_amount) if (not sequence_ok or early_leave) else 0.0
+        )
+
+        raw_total = pen_absence + pen_fixed_9000
+        total = raw_total if rule.penalty_cap is None else min(raw_total, float(rule.penalty_cap))
+
+        return total, {
+            "rule": "家事临时约定(3/10–3/13)",
+            "sequence_ok": sequence_ok,
+            "home_window": [w0, w1],
+            "minutes_not_home_in_window": minutes_not_home,
+            "pickup_done_minute": pickup_done_time,
+            "first_home_minute": first_home_arrival,
+            "penalty_absence_minutes": round(pen_absence, 2),
+            "triggers_spouse_incomplete": not sequence_ok,
+            "never_arrived_home": never_arrived_home,
+            "left_after_arrival": left_after_arrival,
+            "triggers_early_leave": early_leave,
+            "penalty_fixed_9000": round(pen_fixed_9000, 2),
+            "penalty": round(total, 2),
+        }
+
+
+_PREFERENCE_CALCULATORS: dict[str, DriverPreferenceCalculatorBase] = {
+    "D001": DriverD001PreferenceCalculator(),
+    "D002": DriverD002PreferenceCalculator(),
+    "D003": DriverD003PreferenceCalculator(),
+    "D004": DriverD004PreferenceCalculator(),
+    "D005": DriverD005PreferenceCalculator(),
+    "D006": DriverD006PreferenceCalculator(),
+    "D007": DriverD007PreferenceCalculator(),
+    "D008": DriverD008PreferenceCalculator(),
+    "D009": DriverD009PreferenceCalculator(),
+    "D010": DriverD010PreferenceCalculator(),
+}
+
+_MIN_PREFERENCE_RULES_PER_DRIVER: dict[str, int] = {
+    "D001": 3,
+    "D002": 3,
+    "D003": 3,
+    "D004": 3,
+    "D005": 3,
+    "D006": 4,
+    "D007": 4,
+    "D008": 4,
+    "D009": 3,
+    "D010": 4,
+}
+
+
+def _evaluate_preferences(
+    driver_id: str,
+    file_path: Path,
+    rules: list[PreferenceRuleSpec],
+    cargo_map: dict[str, dict[str, Any]],
+    simulation_duration_days: int,
+) -> tuple[float, dict[str, Any]]:
+    calc = _PREFERENCE_CALCULATORS.get(driver_id)
+    if calc is None:
+        return 0.0, {"rules": []}
+    need = _MIN_PREFERENCE_RULES_PER_DRIVER.get(driver_id, 0)
+    if need and len(rules) < need:
+        raise ValueError(f"{driver_id} 的 preferences 在 drivers.json 中至少需要 {need} 条，当前 {len(rules)}")
+    ctxs = _build_step_contexts(file_path)
+    if not ctxs:
+        return 0.0, {"rules": []}
+    return calc.compute(ctxs, cargo_map, rules, simulation_duration_days)
 
 
 def _validate_and_compute_income_by_driver(
@@ -523,10 +1250,7 @@ def _validate_and_compute_income_by_driver(
                     expected_exec = pickup_minutes + wait_minutes + int(cargo["cost_time_minutes"])
                     if action_exec_cost != expected_exec:
                         raise ValueError(f"{file_path.name} 第 {line_no} 行接单耗时不一致")
-                    # 不信任日志中的可选标记，收益资格由脚本按仿真上界自行判定。
-                    income_eligible = (
-                        simulation_horizon_minutes is None or int(end_minutes) <= int(simulation_horizon_minutes)
-                    )
+                    income_eligible = simulation_horizon_minutes is None or int(end_minutes) <= int(simulation_horizon_minutes)
                     if income_eligible:
                         income["gross_income"] += float(cargo["price"])
                     income["distance_km"] += float(result.get("pickup_deadhead_km", 0.0) or 0.0)
@@ -548,7 +1272,7 @@ def compute_income(
     files: list[Path],
     cargo_map: dict[str, dict[str, Any]],
     driver_cost_map: dict[str, float],
-    driver_preferences_map: dict[str, list[str]],
+    driver_preference_rules: dict[str, list[PreferenceRuleSpec]],
     reposition_speed_km_per_hour: float,
     simulation_duration_days: int,
 ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, int]], dict[str, int], dict[str, str], dict[str, dict[str, Any]]]:
@@ -573,7 +1297,8 @@ def compute_income(
             preference_penalty, preference_details = _evaluate_preferences(
                 driver_id,
                 file_path,
-                driver_preferences_map.get(driver_id, []),
+                driver_preference_rules.get(driver_id, []),
+                cargo_map,
                 simulation_duration_days=simulation_duration_days,
             )
             income_item["preference_penalty"] = round(float(preference_penalty), 2)
@@ -632,30 +1357,39 @@ def build_drivers_payload(
     return rows
 
 
-def main() -> None:
-    if not CARGO_DATASET.is_file():
-        raise FileNotFoundError(f"缺少货源数据: {CARGO_DATASET}")
-    if not DRIVERS_DATASET.is_file():
-        raise FileNotFoundError(f"缺少司机数据: {DRIVERS_DATASET}")
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    cargo_map = load_cargo_map(CARGO_DATASET)
-    driver_cost_map = load_driver_cost_map(DRIVERS_DATASET)
-    driver_preferences_map = load_driver_preferences_map(DRIVERS_DATASET)
-    reposition_speed_km_per_hour = load_reposition_speed_km_per_hour(CONFIG_PATH)
-    simulation_duration_days = load_simulation_duration_days(RUN_SUMMARY_FILE)
-    result_files = iter_result_files(RESULTS_DIR)
+def main(project_root: Path | None = None, results_dir: Path | None = None) -> None:
+    layout_root = (project_root if project_root is not None else _SCRIPT_DIR).resolve()
+    results_dir_path = (results_dir.resolve() if results_dir is not None else layout_root / "results").resolve()
+    server_root = layout_root / "server"
+    cargo_dataset = server_root / "data" / "cargo_dataset.jsonl"
+    drivers_dataset = server_root / "data" / "drivers.json"
+    config_path = _resolve_config_json(server_root / "config")
+    output_file = results_dir_path / "monthly_income_202603.json"
+    run_summary_file = results_dir_path / "run_summary_202603.json"
+
+    if not cargo_dataset.is_file():
+        raise FileNotFoundError(f"缺少货源数据: {cargo_dataset}")
+    if not drivers_dataset.is_file():
+        raise FileNotFoundError(f"缺少司机数据: {drivers_dataset}")
+    results_dir_path.mkdir(parents=True, exist_ok=True)
+    cargo_map = load_cargo_map(cargo_dataset)
+    driver_cost_map = load_driver_cost_map(drivers_dataset)
+    driver_preference_rules = load_driver_preference_rules(drivers_dataset)
+    reposition_speed_km_per_hour = load_reposition_speed_km_per_hour(config_path)
+    simulation_duration_days = load_simulation_duration_days(run_summary_file)
+    result_files = iter_result_files(results_dir_path)
     income, token_by_driver, total_token_usage, validation_errors, preference_details_by_driver = compute_income(
         result_files,
         cargo_map,
         driver_cost_map,
-        driver_preferences_map,
+        driver_preference_rules,
         reposition_speed_km_per_hour=reposition_speed_km_per_hour,
         simulation_duration_days=simulation_duration_days,
     )
     drivers = build_drivers_payload(income, token_by_driver, validation_errors, preference_details_by_driver)
     total_net_income = round(sum(float(d["income"]["net_income"]) for d in drivers), 2)
     total_preference_penalty = round(sum(float(d["income"].get("preference_penalty", 0.0)) for d in drivers), 2)
-    simulate_time_seconds = load_simulate_time_seconds(RUN_SUMMARY_FILE)
+    simulate_time_seconds = load_simulate_time_seconds(run_summary_file)
     payload = {
         "month": "2026-03",
         "simulate_time_seconds": simulate_time_seconds,
@@ -671,9 +1405,23 @@ def main() -> None:
         "cost_meaning": "cost = distance_km * cost_per_km (driver cost per km)",
         "cost_metric": "net_income = gross_income - (distance_km * cost_per_km)",
     }
-    OUTPUT_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    output_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="计算 2026 年 3 月司机累计收益（读取 config 空驶速度）")
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        help="含 server/data 的布局根目录；默认脚本所在目录（其下需有 server/data）",
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=None,
+        help="仿真结果目录（含 actions_202603_*.jsonl、run_summary_202603.json）；默认 <project-root>/results",
+    )
+    args = parser.parse_args()
+    main(project_root=args.project_root, results_dir=args.results_dir)

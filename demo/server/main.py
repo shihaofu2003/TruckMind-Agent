@@ -1,4 +1,4 @@
-"""评测入口：配置 `config/config.json` 后执行本脚本，结果写入与 `server` 平级的 `demo/results/`（无 HTTP 服务）。"""
+"""评测入口：配置 `config/config.json` 后执行本脚本，结果写入与 `server` 平级的 `demo/results/`（无 HTTP）。"""
 
 from __future__ import annotations
 

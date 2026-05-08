@@ -8,6 +8,30 @@ from pathlib import Path
 from typing import Any
 
 _SIMULATION_EPOCH = datetime(2026, 3, 1, 0, 0, 0)
+_WALL_TIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _preference_visible_at_wall_time(preference: Any, now: datetime) -> bool:
+    """仅当偏好含 start_time/end_time 时按墙钟过滤；缺省或无法解析则始终返回。"""
+    if isinstance(preference, str):
+        return True
+    if not isinstance(preference, dict):
+        return True
+    start_s = preference.get("start_time")
+    end_s = preference.get("end_time")
+    if start_s is None or end_s is None:
+        return True
+    try:
+        start = datetime.strptime(str(start_s).strip(), _WALL_TIME_FMT)
+        end = datetime.strptime(str(end_s).strip(), _WALL_TIME_FMT)
+    except ValueError:
+        return True
+    return start <= now <= end
+
+
+def _preferences_visible_at(preferences: list[Any], wall_time_str: str) -> list[Any]:
+    now = datetime.strptime(wall_time_str, _WALL_TIME_FMT)
+    return [p for p in preferences if _preference_visible_at_wall_time(p, now)]
 
 
 class DriverStateManager:
@@ -83,14 +107,17 @@ class DriverStateManager:
         simulation_progress_minutes = self._simulation_progress_minutes
         simulation_wall_time = (
             _SIMULATION_EPOCH + timedelta(minutes=int(simulation_progress_minutes))
-        ).strftime("%Y-%m-%d %H:%M:%S")
+        ).strftime(_WALL_TIME_FMT)
+
+        raw_preferences = list(profile.get("preferences", []))
+        preferences = _preferences_visible_at(raw_preferences, simulation_wall_time)
 
         return {
             "driver_id": driver_id,
             "name": profile.get("name", ""),
             "vehicle_no": profile.get("vehicle_no", ""),
             "truck_length": profile.get("truck_length", ""),
-            "preferences": list(profile.get("preferences", [])),
+            "preferences": preferences,
             "current_lat": float(profile.get("current_lat", 0.0)),
             "current_lng": float(profile.get("current_lng", 0.0)),
             "is_current": driver_id == self._current_driver_id,
@@ -127,7 +154,7 @@ class DriverStateManager:
 
     def get_simulation_wall_time(self) -> str:
         return (_SIMULATION_EPOCH + timedelta(minutes=int(self._simulation_progress_minutes))).strftime(
-            "%Y-%m-%d %H:%M:%S"
+            _WALL_TIME_FMT
         )
 
     def take_order(
